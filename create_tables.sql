@@ -149,3 +149,86 @@ ENGINE = InnoDB;
 SET SQL_MODE=@OLD_SQL_MODE;
 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;
 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS;
+	       
+	       
+DROP EVENT IF EXISTS PerformTransaction;   
+DROP EVENT IF EXISTS CheckExpired;
+DROP TRIGGER IF EXISTS SetOccupied;
+
+-- ---------------
+-- no renting from apartment you own
+-- End date after start date
+-- No two leases on one active unit. 
+-- ---------------
+
+
+
+DELIMITER $$
+CREATE TRIGGER SetOccupied
+	AFTER INSERT ON Lease
+    FOR EACH ROW
+    BEGIN
+      IF (count(SELECT * FROM Unit u WHERE u.unit_id == new.unit_id AND u.occupied == 1) == 0
+        AND new.start_date < new.end_date
+        AND new.leasing_user_id <> (
+          SELECT owner_id FROM Property p 
+          WHERE p.property_id == (
+            SELECT property_id FROM unit u 
+            WHERE u.unit_id == new.unit_id)
+        )
+      )
+      THEN
+        UPDATE Unit SET 
+          occupied = 1 
+          WHERE unit_id == new.unit_id;
+      END IF;
+    END$$
+DELIMITER;
+
+
+-- ---------------
+-- Check_expired
+-- Once a day, on whatever second we build the schema, runs over all leases and checks if any one expired the previous day. 
+-- If so, set occupied = 0
+-- ---------------
+
+CREATE EVENT checkExpired
+    ON SCHEDULE EVERY 1 DAY
+    STARTS CURRENT_TIMESTAMP
+    ENDS CURRENT_TIMESTAMP + INTERVAL 1 MONTH
+    DO
+      UPDATE unit SET occupied = 0
+      WHERE unit_id IN (
+        SELECT unit_id FROM Lease l 
+          WHERE Datediff(l.end_date, CURRENT_TIMESTAMP()) >= 0 
+          AND Datediff(l.end_date, CURRENT_TIMESTAMP()) < 1
+        )
+      ); 
+
+-- ---------------
+-- Perform_transaction
+-- Once a month
+-- subtract active lease cost from tenant 
+-- add active lease cost to renter
+-- ---------------
+
+CREATE EVENT PerformTransaction
+    ON SCHEDULE EVERY 1 MONTH
+    STARTS CURRENT_TIMESTAMP
+    ENDS CURRENT_TIMESTAMP + INTERVAL 1 MONTH -- be kind to sunapee
+    DO
+      START TRANSACTION;
+        UPDATE user u SET u.account_balance = u.account_balance - sum( -- Charge
+          SELECT price_monthly FROM Lease l (
+            WHERE l.leasing_user_id == u.id
+            AND (GETDATE() > l.start_date AND GETDATE() < l.end_date)
+          )
+        );
+        UPDATE User u SET u.account_balance = u.account_balance + sum( -- Pay
+          SELECT market_price FROM Unit k ( -- could cause inconsistencies? Maybe fix later. 
+            WHERE k.owner_id == u.id
+            AND (GETDATE() > l.start_date AND GETDATE() < l.end_date) 
+          )
+        )
+      COMMIT;
+
